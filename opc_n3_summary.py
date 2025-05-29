@@ -14,6 +14,39 @@ import pandas as pd
 BIN_PREFIX = "Bin"
 TEMP_KEYS = ("temperature", "temp")
 HUM_KEYS = ("humidity", "hum", "rh")
+ANSI_RED = "41"
+ANSI_YELLOW = "43"
+ANSI_GREEN = "42"
+RESET = "\033[0m"
+
+
+def decile_counts(df: pd.DataFrame, bin_col: str) -> list[int]:
+    """Return list with 10 sums of `bin_col`, one per 10-% segment of df."""
+    n = len(df)
+    step = max(1, n // 10)
+    return [
+        df[bin_col].iloc[i: i + step].sum()
+        for i in range(0, n, step)
+    ][:10]                               # exactly 10 elements
+
+
+def colour_block(ratio: float) -> str:
+    """Green <0.33, Yellow 0.33-0.66, Red >0.66."""
+    if ratio > 0.66:
+        code = ANSI_RED
+    elif ratio > 0.33:
+        code = ANSI_YELLOW
+    else:
+        code = ANSI_GREEN
+    return f"\033[{code}m  {RESET}"      # two-space block
+
+
+def timeline_bar(counts: list[int]) -> str:
+    """Return coloured 10-block bar for one size bin."""
+    if not counts or max(counts) == 0:
+        return " " * 20                  # blank if no data
+    maxc = max(counts)
+    return "".join(colour_block(c / maxc) for c in counts)
 
 
 def detect_skip(file_path: Path, fallback: int = 14) -> int:
@@ -52,7 +85,7 @@ def find_column(df: pd.DataFrame, keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def aggregate(file_path: Path, skip: int | None) -> tuple[pd.DataFrame, dict]:
+def aggregate(file_path: Path, skip: int | None) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """Return (size-bin summary, climate stats dict)."""
     if skip is None:
         skip = detect_skip(file_path)
@@ -88,7 +121,7 @@ def aggregate(file_path: Path, skip: int | None) -> tuple[pd.DataFrame, dict]:
         stats["hum_max"] = df[hum_col].max()
         stats["hum_mean"] = df[hum_col].mean()
 
-    return bin_summary, stats
+    return bin_summary, stats, df
 
 
 def main() -> None:
@@ -106,10 +139,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    summary, stats = aggregate(args.input_csv, args.skip)
+    summary, stats, df = aggregate(args.input_csv, args.skip)
+    bin_cols = [c for c in df.columns if str(c).startswith(BIN_PREFIX)]
 
     print("\nGesamtsummen pro Größen-Bin:\n")
-    print(summary.to_string(index=False))
+    for (size, total), bin_col in zip(summary.itertuples(index=False), bin_cols):
+        counts10 = decile_counts(df, bin_col)
+        bar = timeline_bar(counts10)
+        print(f"{size:<22} {total:8d} {bar}")
 
     print("\nZusatzinformationen:")
     print(f"  Messpunkte gesamt  : {stats['entries']}")
