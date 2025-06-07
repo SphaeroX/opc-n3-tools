@@ -225,6 +225,9 @@ def read_live_data(com_port_value: str, num_readings: int = 60, update_interval_
     # Ensure imports for SPI, opc, pd, process_live_data, print_summary_and_timeline, clear_console, DEFAULT_LIVE_DATA_BIN_LABELS, BIN_PREFIX are available in scope.
     # For simplicity, assume they are globally accessible or imported.
 
+    # Print num_readings at the beginning to confirm it's received, before potential connection errors.
+    print(f"Live data mode initiated for {com_port_value}. Target readings: {num_readings}, Update interval: {update_interval_secs}s.")
+
     if not USBISS_AVAILABLE:
         # This check is technically redundant if main() already checks USBISS_AVAILABLE before calling,
         # but kept for safety if the function is ever called directly.
@@ -255,8 +258,9 @@ def read_live_data(com_port_value: str, num_readings: int = 60, update_interval_
     print(f'Firmware version: {firmware_version_str}')
 
     live_data_list = []
-    print(f"Powering on sensor. Preparing for {num_readings} total readings.")
-    print(f"Display will update every {update_interval_secs} second(s). Press Ctrl+C to stop early.")
+    # The "Powering on sensor" message will now come after successful connection and before the loop.
+    # print(f"Powering on sensor. Preparing for {num_readings} total readings.") # Moved effectively
+    print(f"Display will update every {update_interval_secs} second(s) once readings start. Press Ctrl+C to stop early.")
     dev.on()
 
     try:
@@ -485,6 +489,12 @@ def main() -> None:
         default=None,
         help="Number of header lines to skip in the input CSV file. If not provided, the script attempts to auto-detect the header length. Only applicable when input_csv is used.",
     )
+    parser.add_argument(
+        "--num_readings", "-n",
+        type=int,
+        default=30,
+        help="Number of readings to take in live data mode (default: 30). Only applicable when --com_port is used."
+    )
     args = parser.parse_args()
 
     # Add validation logic
@@ -507,7 +517,7 @@ def main() -> None:
             # For now, use a fixed number, e.g., 30 for 30 seconds.
             # update_interval_secs=1 means update every second.
             # The `read_live_data` itself now handles the KeyboardInterrupt for stopping.
-            full_live_df = read_live_data(args.com_port, num_readings=30, update_interval_secs=1)
+            full_live_df = read_live_data(args.com_port, num_readings=args.num_readings, update_interval_secs=1)
 
             clear_console() # Clear the last live update screen
             print("--- FINAL SUMMARY OF LIVE DATA ---")
