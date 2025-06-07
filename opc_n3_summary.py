@@ -94,10 +94,12 @@ def extract_boundaries(lines: list[str]) -> list[float]:
 
 
 def make_size_labels(boundaries: list[float]) -> list[str]:
-    """Return one label per bin (closed intervals only)."""
+    """Return one label per bin (closed intervals only), max 24 labels."""
+    # Max 24 bins for OPC-N3 typically.
+    num_labels = min(len(boundaries) - 1, 24)
     return [
         f"[{boundaries[i]:.3f} – {boundaries[i + 1]:.3f}) µm"
-        for i in range(len(boundaries) - 1)
+        for i in range(num_labels)
     ]
 
 
@@ -116,20 +118,76 @@ def aggregate(file_path: Path, skip: int | None) -> tuple[pd.DataFrame, dict, pd
     if skip is None:
         skip = detect_skip(file_path)
 
-    with file_path.open(encoding="utf-8") as fh:
-        header_lines = [next(fh) for _ in range(skip)]
+    # Initialize output_size_labels with default "Bin 0" to "Bin 23"
+    output_size_labels = [f"{BIN_PREFIX}{i}" for i in range(24)] # Uses "Bin0", "Bin1" (no space)
 
-    boundaries = extract_boundaries(header_lines)
-    size_labels = make_size_labels(boundaries)
+    try:
+        with file_path.open(encoding="utf-8") as fh:
+            header_lines = [next(fh) for _ in range(skip)]
+        boundaries = extract_boundaries(header_lines)
+        csv_size_labels = make_size_labels(boundaries) # Capped at 24 by make_size_labels
+
+        # Override default labels with what we found from CSV header
+        for i in range(len(csv_size_labels)):
+            if i < 24:
+                output_size_labels[i] = csv_size_labels[i]
+        # If csv_size_labels has fewer than 24, remaining output_size_labels stay as "BinX"
+    except RuntimeError as e: # Specifically for extract_boundaries or make_size_labels issues
+        print(f"Warning: Could not determine size bin labels from CSV header ({e}). Using default '{BIN_PREFIX}N' labels.", file=sys.stderr)
+    except FileNotFoundError: # Reraise if file not found, so main can handle it.
+        raise
+    except Exception as e: # Catch other potential errors during header processing
+        print(f"Warning: Error processing CSV header for size labels ({e}). Using default '{BIN_PREFIX}N' labels.", file=sys.stderr)
 
     df = pd.read_csv(file_path, skiprows=skip, header=0)
-    bin_cols = [c for c in df.columns if str(c).startswith(BIN_PREFIX)]
-    if not bin_cols:
-        raise RuntimeError("No Bin* columns found – wrong --skip value?")
 
-    totals = df[bin_cols].sum().astype(int)
-    bin_summary = pd.DataFrame(
-        {"size_range": size_labels, "total_count": totals})
+    # Determine bin_cols_to_process from df: "Bin 0" through "Bin 23" that actually exist
+    bin_cols_to_process = []
+    # Standardized keys for totals_series (used for lookup later)
+    standardized_keys_for_totals = []
+
+    for i in range(24):
+        # Prefer "BinN" (no space, matching DEFAULT_LIVE_DATA_BIN_LABELS)
+        col_name_no_space = f"{BIN_PREFIX}{i}"
+        col_name_with_space = f"{BIN_PREFIX} {i}" # Common in some CSVs or OPC outputs
+
+        actual_col_in_df = None
+        standard_key = col_name_no_space # Key for totals_series should be standardized
+
+        if col_name_no_space in df.columns and pd.api.types.is_numeric_dtype(df[col_name_no_space]):
+            actual_col_in_df = col_name_no_space
+        elif col_name_with_space in df.columns and pd.api.types.is_numeric_dtype(df[col_name_with_space]):
+            actual_col_in_df = col_name_with_space
+
+        if actual_col_in_df:
+            bin_cols_to_process.append(actual_col_in_df)
+            standardized_keys_for_totals.append(standard_key) # Store the key we'll use for this column's total
+
+    totals_series = pd.Series(dtype='int')
+    if bin_cols_to_process:
+        # Sum using actual column names found, then re-index with standardized keys
+        raw_totals = df[bin_cols_to_process].sum().astype(int)
+        # Ensure raw_totals.index matches bin_cols_to_process before creating dictionary for reindexing
+        totals_dict_for_reindex = {}
+        for idx, actual_col_name in enumerate(bin_cols_to_process):
+            if idx < len(standardized_keys_for_totals): # Should always be true
+                 totals_dict_for_reindex[standardized_keys_for_totals[idx]] = raw_totals.get(actual_col_name, 0)
+        totals_series = pd.Series(totals_dict_for_reindex)
+
+
+    # Construct bin_summary DataFrame (must have 24 rows)
+    total_counts_for_summary = []
+    for i in range(24):
+        lookup_key = f"{BIN_PREFIX}{i}" # Standard key "Bin0", "Bin1"
+        total_counts_for_summary.append(totals_series.get(lookup_key, 0))
+
+    bin_summary = pd.DataFrame({
+        "size_range": output_size_labels, # Should be 24 display labels
+        "total_count": total_counts_for_summary
+    })
+    if len(bin_summary) != 24: # Should not happen with current logic
+        print(f"Warning: aggregate produced bin_summary with {len(bin_summary)} rows, expected 24.", file=sys.stderr)
+
 
     stats: dict[str, float | int | str] = {}
     stats["entries"] = len(df)
@@ -250,43 +308,67 @@ def read_live_data(com_port_value: str, num_readings: int = 60, update_interval_
 def process_live_data(df: pd.DataFrame) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """Processes a DataFrame from live sensor readings to generate summary and stats."""
     if df.empty:
-        # Return empty structures if no data
-        return pd.DataFrame(columns=["size_range", "total_count"]), {"entries": 0, "runtime": "0s"}, df
+        # Return empty structures if no data, ensuring bin_summary matches expected 24 rows for consistency
+        # if DEFAULT_LIVE_DATA_BIN_LABELS is used downstream without checking for emptiness.
+        # However, print_summary_and_timeline handles empty summary_df.
+        # For strictness, let's create a 24-row summary with 0 counts if df is empty.
+        actual_bin_labels_for_empty = DEFAULT_LIVE_DATA_BIN_LABELS[:24]
+        empty_bin_summary = pd.DataFrame({
+            "size_range": actual_bin_labels_for_empty,
+            "total_count": [0] * len(actual_bin_labels_for_empty)
+        })
+        return empty_bin_summary, {"entries": 0, "runtime": "0s"}, df
 
-    # Identify bin columns - they are already named 'Bin 0', 'Bin 1', etc.
-    bin_cols = [col for col in df.columns if col.startswith(BIN_PREFIX)]
-    if not bin_cols:
-        # Fallback if somehow bin columns are not named as expected
-        # This shouldn't happen if read_live_data works correctly
-        bin_cols = [col for col in df.columns if "Bin" in col]
+    # 1. Identify all potential bin columns from df and sort them
+    potential_bin_cols = []
+    for col in df.columns:
+        if col.startswith(BIN_PREFIX):
+            try:
+                # Extract number for sorting, assuming format "Bin X"
+                bin_num_str = col[len(BIN_PREFIX):].strip()
+                if bin_num_str.isdigit():
+                    potential_bin_cols.append((int(bin_num_str), col))
+            except ValueError:
+                # Column starts with BIN_PREFIX but isn't like "Bin X"
+                pass # Ignore if not a parsable bin number
+    potential_bin_cols.sort() # Sort by bin number
 
-    # Use default labels for the summary. Ensure the count matches actual bin_cols found.
-    # If specific size ranges become available later, this can be updated.
-    actual_bin_labels = DEFAULT_LIVE_DATA_BIN_LABELS[:len(bin_cols)]
-    if len(bin_cols) > len(DEFAULT_LIVE_DATA_BIN_LABELS):
-        # If more bins than expected, extend labels
-        actual_bin_labels.extend([f"Bin {i}" for i in range(len(DEFAULT_LIVE_DATA_BIN_LABELS), len(bin_cols))])
-    elif len(bin_cols) < len(DEFAULT_LIVE_DATA_BIN_LABELS) and len(bin_cols) > 0:
-        # If fewer bins than default (e.g. if histogram changes), truncate default labels
-        actual_bin_labels = DEFAULT_LIVE_DATA_BIN_LABELS[:len(bin_cols)]
-    elif not bin_cols: # No bin columns found
-            actual_bin_labels = []
+    # 2. Filter for Bins 0-23 that actually exist in df
+    processed_bin_cols = []
+    for bin_num, col_name in potential_bin_cols:
+        if 0 <= bin_num <= 23:
+            if col_name in df.columns: # Ensure column actually exists
+                 processed_bin_cols.append(col_name)
+        # Bins > 23 are ignored for bin_summary
 
+    # 3. Define Output Bin Labels (always Bin 0-23)
+    # Ensure DEFAULT_LIVE_DATA_BIN_LABELS provides at least 24 labels, or adjust.
+    # Assuming DEFAULT_LIVE_DATA_BIN_LABELS is ["Bin 0", "Bin 1", ..., "Bin 23", ...]
+    actual_bin_labels = DEFAULT_LIVE_DATA_BIN_LABELS[:24]
 
-    totals = df[bin_cols].sum().astype(int)
-    # Reset index of totals to ensure it aligns with actual_bin_labels if bin_cols were not perfectly sequential
-    totals = totals.reset_index(drop=True)
+    # 4. Calculate Totals Series for processed_bin_cols
+    totals_series = pd.Series(dtype='int') # Default to empty series
+    if processed_bin_cols: # Only sum if there are relevant columns
+        # Ensure we only try to sum columns that are actually in the DataFrame and numeric
+        numeric_cols_to_sum = [col for col in processed_bin_cols if pd.api.types.is_numeric_dtype(df[col])]
+        if numeric_cols_to_sum:
+            totals_series = df[numeric_cols_to_sum].sum().astype(int)
+        # totals_series will have an index like ["Bin 0", "Bin 1", ...] for columns that were summed
 
-    bin_summary_data = {"size_range": actual_bin_labels}
-    # Check if totals Series is empty before trying to assign it
-    if not totals.empty:
-        bin_summary_data["total_count"] = totals.tolist() # Convert Series to list
-    else:
-        bin_summary_data["total_count"] = [0] * len(actual_bin_labels)
+    # 5. Construct bin_summary DataFrame (must have 24 rows)
+    total_counts_for_summary = []
+    for label in actual_bin_labels: # e.g., "Bin 0", "Bin 1", ... "Bin 23"
+        if label in totals_series.index:
+            total_counts_for_summary.append(totals_series[label])
+        else:
+            total_counts_for_summary.append(0)
 
-    bin_summary = pd.DataFrame(bin_summary_data)
+    bin_summary = pd.DataFrame({
+        "size_range": actual_bin_labels,
+        "total_count": total_counts_for_summary
+    })
 
-
+    # 6. Stats Calculation (remains unchanged, uses original full df)
     stats: dict[str, float | int | str] = {}
     stats["entries"] = len(df)
     # Estimate runtime: assume 1 reading per second, from num_readings in read_live_data
@@ -312,57 +394,44 @@ def process_live_data(df: pd.DataFrame) -> tuple[pd.DataFrame, dict, pd.DataFram
 
 def print_summary_and_timeline(summary_df: pd.DataFrame,
                                stats: dict,
-                               data_df: pd.DataFrame,
-                               bin_cols_list: list[str],
-                               is_live_data: bool = False): # Added flag for minor behavioral changes if needed
-    """Prints the summary, statistics, and timeline bar for particle data."""
+                               data_df: pd.DataFrame, # This is the raw data (processed_df from main)
+                               is_live_data: bool = False):
+    """Prints the summary, statistics, and timeline bar for particle data (Bins 0-23)."""
     print("\nGesamtsummen pro Größen-Bin:\n")
 
-    # Ensure summary_df has 'size_range' and 'total_count' and bin_cols_list is not empty
-    # before iterating.
-    if "size_range" not in summary_df.columns or \
-       "total_count" not in summary_df.columns or \
-       (not summary_df.empty and len(summary_df) != len(bin_cols_list)): # Check length if summary_df is not empty
-        # This condition might be too strict if summary_df can have fewer rows than bin_cols_list
-        # (e.g. if some bins had no data and were omitted from summary_df, though current
-        # process_live_data and aggregate ensure they match)
-        # For now, assume they match. If not, the zip will truncate.
-        if not bin_cols_list and not summary_df.empty:
-                print("Warning: Bin columns list is empty, but summary data exists. Cannot generate timeline bars.")
-        elif summary_df.empty and bin_cols_list and stats.get("entries", 0) > 0 : # only warn if there were entries
-                print("Warning: Summary data is empty, but bin columns list exists. Cannot generate timeline bars for these bins.")
-        # If both are empty (e.g. no data), it will just skip the loop, which is fine.
-        # If lengths mismatch and not empty, it's also a warning state for the loop below.
+    # summary_df is guaranteed to have 24 rows by process_live_data and aggregate
+    for i in range(len(summary_df)): # Should be 24 iterations
+        display_label = summary_df.iloc[i]["size_range"]
+        total = summary_df.iloc[i]["total_count"]
 
-    # Iterate through summary_df rows and corresponding bin_cols_list names
-    # The original code iterates `zip(summary.itertuples(index=False), bin_cols)`
-    # We need to ensure summary_df rows align with bin_cols_list
-    # `process_live_data` and `aggregate` should ensure `summary_df` has one row per bin,
-    # and `bin_cols_list` refers to the columns in `data_df`.
+        # Data for timeline bar is fetched from data_df.
+        # `opc.histogram()` keys are 'Bin 0', 'Bin 1', ... (with a space).
+        # `process_live_data` uses these directly, so data_df from live data has "Bin X" columns.
+        # `aggregate` needs to ensure its `df` (which becomes data_df) also provides these.
+        # The `bin_cols_to_process` in `aggregate` finds actual column names,
+        # but `data_df` needs to be queryable by a standard "Bin X" name for this loop.
+        # The `data_df` passed here IS the raw df from CSV or live_df.
+        # So we need to check for "Bin X" (with space) and "BinX" (no space) in it.
 
-    # If summary_df was created from totals of bin_cols_list, they should have the same length.
-    # summary_df has 'size_range' and 'total_count'.
-    # bin_cols_list are the actual column names from data_df (e.g., "Bin 0", "Bin 1", ...).
+        data_col_name_with_space = f"{BIN_PREFIX} {i}" # e.g. "Bin 0"
+        data_col_name_no_space = f"{BIN_PREFIX}{i}"   # e.g. "Bin0"
 
-    idx = 0
-    for row_tuple in summary_df.itertuples(index=False):
-        # row_tuple will be a named tuple with fields 'size_range' and 'total_count'
-        size_label = getattr(row_tuple, 'size_range', 'N/A') # Use getattr for safety
-        total = getattr(row_tuple, 'total_count', 0)
+        bar = " " * 20 # Default empty bar
+        actual_data_col_for_timeline = None
 
-        if idx < len(bin_cols_list):
-            bin_col_name = bin_cols_list[idx]
-            if bin_col_name in data_df.columns:
-                counts10 = decile_counts(data_df, bin_col_name)
-                bar = timeline_bar(counts10)
-                print(f"{size_label:<22} {total:8d} {bar}")
-            else:
-                # This case should ideally not happen if bin_cols_list is derived from data_df.columns
-                print(f"{size_label:<22} {total:8d} {'Timeline N/A: Bin column not found'}")
-        else:
-            # This case means summary_df has more rows than bin_cols_list, which is unexpected.
-            print(f"{size_label:<22} {total:8d} {'Timeline N/A: No corresponding bin column'}")
-        idx += 1
+        if data_col_name_with_space in data_df.columns:
+            actual_data_col_for_timeline = data_col_name_with_space
+        elif data_col_name_no_space in data_df.columns:
+            actual_data_col_for_timeline = data_col_name_no_space
+
+        if actual_data_col_for_timeline and not data_df[actual_data_col_for_timeline].empty:
+            counts10 = decile_counts(data_df, actual_data_col_for_timeline)
+            bar = timeline_bar(counts10)
+        elif actual_data_col_for_timeline: # Column exists but is empty/all-NaN
+             bar = " (no data in col) "
+        # else: bar remains the default empty bar if column not found.
+
+        print(f"{str(display_label):<22} {total:8d} {bar}")
 
     print("\nZusatzinformationen:")
     if stats.get("entries", 0) == 0:
@@ -430,10 +499,8 @@ def main() -> None:
     # Conditional processing based on input type
     if args.com_port:
         try:
-            print("Starting live data acquisition mode...")
-            # Set a small number of readings for easier/quicker testing during development
-            live_df = read_live_data(args.com_port, num_readings=10)
-
+            # Removed the first, seemingly redundant call to read_live_data.
+            # The main call is below for full_live_df.
             print("Starting live data acquisition mode with iterative display...")
             # num_readings can be made an argument to the script later if desired
             # For now, use a fixed number, e.g., 30 for 30 seconds.
@@ -445,16 +512,14 @@ def main() -> None:
             print("--- FINAL SUMMARY OF LIVE DATA ---")
             if full_live_df.empty:
                 print("No data was collected during the live session.")
-                # Call print_summary_and_timeline with empty data to show "Keine Datenpunkte"
-                empty_summary, empty_stats, empty_df = process_live_data(pd.DataFrame())
-                empty_bin_cols = []
-                print_summary_and_timeline(empty_summary, empty_stats, empty_df, empty_bin_cols, is_live_data=True)
+                # process_live_data now returns a 24-row empty summary
+                summary_df, stats, processed_df = process_live_data(pd.DataFrame())
+                print_summary_and_timeline(summary_df, stats, processed_df, is_live_data=True)
             else:
                 print(f"Total data points collected: {len(full_live_df)}")
                 # Process the full dataset for the final summary
                 summary_df, stats, processed_df = process_live_data(full_live_df)
-                bin_cols_for_timeline = [col for col in processed_df.columns if col.startswith(BIN_PREFIX)]
-                print_summary_and_timeline(summary_df, stats, processed_df, bin_cols_for_timeline, is_live_data=True)
+                print_summary_and_timeline(summary_df, stats, processed_df, is_live_data=True)
 
         except RuntimeError as e:
             # This will catch errors from sensor connection primarily
@@ -469,10 +534,9 @@ def main() -> None:
     elif args.input_csv:
         # Current CSV processing logic
         print(f"Starting CSV processing for: {args.input_csv}")
-        summary_df, stats, processed_df = aggregate(args.input_csv, args.skip) # Renamed for consistency
-        bin_cols_for_timeline = [c for c in processed_df.columns if str(c).startswith(BIN_PREFIX)] # Renamed
+        summary_df, stats, processed_df = aggregate(args.input_csv, args.skip) # processed_df is the raw df from csv
 
-        print_summary_and_timeline(summary_df, stats, processed_df, bin_cols_for_timeline, is_live_data=False)
+        print_summary_and_timeline(summary_df, stats, processed_df, is_live_data=False)
 
         if args.out:
             summary_df.to_csv(args.out, index=False) # Use summary_df
