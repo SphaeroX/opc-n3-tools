@@ -8,10 +8,36 @@ import argparse
 from pathlib import Path
 from datetime import timedelta
 import sys
+import os # Added for clear_console
 import pandas as pd
+from time import sleep
+try:
+    from usbiss.spi import SPI
+    import opcng as opc
+    USBISS_AVAILABLE = True
+except ImportError:
+    USBISS_AVAILABLE = False
+    # Define placeholder classes for SPI and opc to allow CSV mode if libraries are missing
+    class SPI: # type: ignore
+        def __init__(self, com_port: str): pass
+        mode = 1; max_speed_hz = 500000; lsbfirst = False # type: ignore
+
+    class OPCN3Placeholder: # type: ignore
+        def info(self): return "N/A (libs missing)"
+        def serial(self): return "N/A (libs missing)"
+        def firmware(self): return "N/A (libs missing)"
+        def on(self): print("Placeholder: Sensor ON (libs missing)")
+        def off(self): print("Placeholder: Sensor OFF (libs missing)")
+        def histogram(self): print("Placeholder: Reading histogram (libs missing)"); return {}
+
+    class opc: # type: ignore
+        @staticmethod
+        def detect(spi_bus_ignored): # type: ignore
+            raise RuntimeError("Sensor libraries (pyusbiss, py-opc-ng) not installed. Cannot use live data mode.")
 
 
 BIN_PREFIX = "Bin"
+DEFAULT_LIVE_DATA_BIN_LABELS = [f"Bin {i}" for i in range(24)] # OPC-N3 has 24 bins
 TEMP_KEYS = ("temperature", "temp")
 HUM_KEYS = ("humidity", "hum", "rh")
 ANSI_RED = "41"
@@ -124,11 +150,263 @@ def aggregate(file_path: Path, skip: int | None) -> tuple[pd.DataFrame, dict, pd
     return bin_summary, stats, df
 
 
+def clear_console():
+    """Clears the terminal screen."""
+    # For Windows
+    if os.name == 'nt':
+        _ = os.system('cls')
+    # For macOS and Linux
+    else:
+        _ = os.system('clear')
+    # A more universal ANSI escape sequence method (might not work on all terminals e.g. basic Windows cmd)
+    # print('[H[J', end='')
+
+
+# Modify existing read_live_data function
+def read_live_data(com_port_value: str, num_readings: int = 60, update_interval_secs: int = 1) -> pd.DataFrame:
+    # Ensure imports for SPI, opc, pd, process_live_data, print_summary_and_timeline, clear_console, DEFAULT_LIVE_DATA_BIN_LABELS, BIN_PREFIX are available in scope.
+    # For simplicity, assume they are globally accessible or imported.
+
+    if not USBISS_AVAILABLE:
+        # This check is technically redundant if main() already checks USBISS_AVAILABLE before calling,
+        # but kept for safety if the function is ever called directly.
+        raise RuntimeError("Critical: USBISS_AVAILABLE is False but execution reached read_live_data.")
+
+    print(f"Attempting to connect to sensor on {com_port_value}...")
+    spi_bus = SPI(com_port_value)
+    spi_bus.mode = 1
+    spi_bus.max_speed_hz = 500000
+    spi_bus.lsbfirst = False
+
+    dev = opc.detect(spi_bus)
+
+    print(f'Device information: {dev.info()}')
+    print(f'Serial: {dev.serial()}')
+
+    firmware_version_str = "N/A"
+    try:
+        firmware_version_str = dev.firmware()
+    except AttributeError:
+        print("Note: dev.firmware() not found. Attempting dev.serial() for firmware version as fallback.")
+        try:
+            firmware_version_str = dev.serial()
+        except AttributeError:
+            print("Note: dev.serial() also not found for firmware version.")
+    except Exception as e:
+        print(f"Error accessing firmware version: {e}")
+    print(f'Firmware version: {firmware_version_str}')
+
+    live_data_list = []
+    print(f"Powering on sensor. Preparing for {num_readings} total readings.")
+    print(f"Display will update every {update_interval_secs} second(s). Press Ctrl+C to stop early.")
+    dev.on()
+
+    try:
+        for i in range(num_readings):
+            sleep(1) # Sleep for 1 second for each reading attempt
+            data = dev.histogram()
+
+            if data:
+                live_data_list.append(data)
+            else:
+                print(f"\nWarning: Received empty data on reading {i+1}/{num_readings}", flush=True)
+                sleep(0.5)
+
+            if (i + 1) % update_interval_secs == 0 or (i + 1) == num_readings:
+                if not live_data_list:
+                    print("No data collected yet to display...", end='\r', flush=True)
+                    continue
+
+                clear_console()
+                print(f"--- LIVE DATA VIEW (Reading {i+1}/{num_readings}) --- Press Ctrl+C to stop ---")
+
+                current_df = pd.DataFrame(live_data_list)
+                summary_df, stats, processed_df = process_live_data(current_df)
+
+                bin_cols_for_timeline = [col for col in processed_df.columns if col.startswith(BIN_PREFIX)]
+
+                print_summary_and_timeline(summary_df, stats, processed_df, bin_cols_for_timeline, is_live_data=True)
+                print(f"\nLast reading: {i+1}/{num_readings}. Total data points: {len(live_data_list)}.")
+                if (i + 1) == num_readings:
+                    print("All live readings complete. Preparing final summary...")
+                    sleep(2) # Pause to see the last live update
+
+        print(" " * 80, end='\r', flush=True) # Clear any leftover progress line
+
+    except KeyboardInterrupt:
+        print("\nLive reading interrupted by user. Processing collected data for final summary...")
+    finally:
+        print("\nPowering off sensor...")
+        dev.off()
+        print("Sensor powered off.")
+
+    if not live_data_list:
+        print("No valid data collected from the sensor during live mode.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(live_data_list)
+
+
+def process_live_data(df: pd.DataFrame) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+    """Processes a DataFrame from live sensor readings to generate summary and stats."""
+    if df.empty:
+        # Return empty structures if no data
+        return pd.DataFrame(columns=["size_range", "total_count"]), {"entries": 0, "runtime": "0s"}, df
+
+    # Identify bin columns - they are already named 'Bin 0', 'Bin 1', etc.
+    bin_cols = [col for col in df.columns if col.startswith(BIN_PREFIX)]
+    if not bin_cols:
+        # Fallback if somehow bin columns are not named as expected
+        # This shouldn't happen if read_live_data works correctly
+        bin_cols = [col for col in df.columns if "Bin" in col]
+
+    # Use default labels for the summary. Ensure the count matches actual bin_cols found.
+    # If specific size ranges become available later, this can be updated.
+    actual_bin_labels = DEFAULT_LIVE_DATA_BIN_LABELS[:len(bin_cols)]
+    if len(bin_cols) > len(DEFAULT_LIVE_DATA_BIN_LABELS):
+        # If more bins than expected, extend labels
+        actual_bin_labels.extend([f"Bin {i}" for i in range(len(DEFAULT_LIVE_DATA_BIN_LABELS), len(bin_cols))])
+    elif len(bin_cols) < len(DEFAULT_LIVE_DATA_BIN_LABELS) and len(bin_cols) > 0:
+        # If fewer bins than default (e.g. if histogram changes), truncate default labels
+        actual_bin_labels = DEFAULT_LIVE_DATA_BIN_LABELS[:len(bin_cols)]
+    elif not bin_cols: # No bin columns found
+            actual_bin_labels = []
+
+
+    totals = df[bin_cols].sum().astype(int)
+    # Reset index of totals to ensure it aligns with actual_bin_labels if bin_cols were not perfectly sequential
+    totals = totals.reset_index(drop=True)
+
+    bin_summary_data = {"size_range": actual_bin_labels}
+    # Check if totals Series is empty before trying to assign it
+    if not totals.empty:
+        bin_summary_data["total_count"] = totals.tolist() # Convert Series to list
+    else:
+        bin_summary_data["total_count"] = [0] * len(actual_bin_labels)
+
+    bin_summary = pd.DataFrame(bin_summary_data)
+
+
+    stats: dict[str, float | int | str] = {}
+    stats["entries"] = len(df)
+    # Estimate runtime: assume 1 reading per second, from num_readings in read_live_data
+    # This is an approximation; 'Sampling Period' in histogram could be more accurate if summed.
+    # For now, let's use the number of entries (which corresponds to num_readings).
+    stats["runtime"] = str(timedelta(seconds=stats["entries"])) # type: ignore
+
+    temp_col = find_column(df, TEMP_KEYS) # TEMP_KEYS = ("temperature", "temp")
+    if temp_col and temp_col in df.columns and not df[temp_col].empty:
+        stats["temp_min"] = df[temp_col].min()
+        stats["temp_max"] = df[temp_col].max()
+        stats["temp_mean"] = df[temp_col].mean()
+
+    hum_col = find_column(df, HUM_KEYS) # HUM_KEYS = ("humidity", "hum", "rh")
+    if hum_col and hum_col in df.columns and not df[hum_col].empty:
+        stats["hum_min"] = df[hum_col].min()
+        stats["hum_max"] = df[hum_col].max()
+        stats["hum_mean"] = df[hum_col].mean()
+
+    # The third element returned by aggregate is the original df, used by decile_counts
+    return bin_summary, stats, df
+
+
+def print_summary_and_timeline(summary_df: pd.DataFrame,
+                               stats: dict,
+                               data_df: pd.DataFrame,
+                               bin_cols_list: list[str],
+                               is_live_data: bool = False): # Added flag for minor behavioral changes if needed
+    """Prints the summary, statistics, and timeline bar for particle data."""
+    print("\nGesamtsummen pro Größen-Bin:\n")
+
+    # Ensure summary_df has 'size_range' and 'total_count' and bin_cols_list is not empty
+    # before iterating.
+    if "size_range" not in summary_df.columns or \
+       "total_count" not in summary_df.columns or \
+       (not summary_df.empty and len(summary_df) != len(bin_cols_list)): # Check length if summary_df is not empty
+        # This condition might be too strict if summary_df can have fewer rows than bin_cols_list
+        # (e.g. if some bins had no data and were omitted from summary_df, though current
+        # process_live_data and aggregate ensure they match)
+        # For now, assume they match. If not, the zip will truncate.
+        if not bin_cols_list and not summary_df.empty:
+                print("Warning: Bin columns list is empty, but summary data exists. Cannot generate timeline bars.")
+        elif summary_df.empty and bin_cols_list and stats.get("entries", 0) > 0 : # only warn if there were entries
+                print("Warning: Summary data is empty, but bin columns list exists. Cannot generate timeline bars for these bins.")
+        # If both are empty (e.g. no data), it will just skip the loop, which is fine.
+        # If lengths mismatch and not empty, it's also a warning state for the loop below.
+
+    # Iterate through summary_df rows and corresponding bin_cols_list names
+    # The original code iterates `zip(summary.itertuples(index=False), bin_cols)`
+    # We need to ensure summary_df rows align with bin_cols_list
+    # `process_live_data` and `aggregate` should ensure `summary_df` has one row per bin,
+    # and `bin_cols_list` refers to the columns in `data_df`.
+
+    # If summary_df was created from totals of bin_cols_list, they should have the same length.
+    # summary_df has 'size_range' and 'total_count'.
+    # bin_cols_list are the actual column names from data_df (e.g., "Bin 0", "Bin 1", ...).
+
+    idx = 0
+    for row_tuple in summary_df.itertuples(index=False):
+        # row_tuple will be a named tuple with fields 'size_range' and 'total_count'
+        size_label = getattr(row_tuple, 'size_range', 'N/A') # Use getattr for safety
+        total = getattr(row_tuple, 'total_count', 0)
+
+        if idx < len(bin_cols_list):
+            bin_col_name = bin_cols_list[idx]
+            if bin_col_name in data_df.columns:
+                counts10 = decile_counts(data_df, bin_col_name)
+                bar = timeline_bar(counts10)
+                print(f"{size_label:<22} {total:8d} {bar}")
+            else:
+                # This case should ideally not happen if bin_cols_list is derived from data_df.columns
+                print(f"{size_label:<22} {total:8d} {'Timeline N/A: Bin column not found'}")
+        else:
+            # This case means summary_df has more rows than bin_cols_list, which is unexpected.
+            print(f"{size_label:<22} {total:8d} {'Timeline N/A: No corresponding bin column'}")
+        idx += 1
+
+    print("\nZusatzinformationen:")
+    if stats.get("entries", 0) == 0:
+        print("  Keine Datenpunkte vorhanden.") # No data points
+        if is_live_data:
+            print("  Sensor hat möglicherweise keine Daten geliefert oder es gab ein Verbindungsproblem.")
+        else: # CSV
+            print("  Die CSV-Datei enthält möglicherweise keine Datenzeilen oder hat ein unerwartetes Format.")
+        return # Don't print other stats if no entries
+
+    print(f"  Messpunkte gesamt  : {stats.get('entries', 'N/A')}")
+    print(f"  Laufzeit           : {stats.get('runtime', 'N/A')}") # Changed from "Laufzeit (1000 ms)"
+
+    if "temp_min" in stats: # Check if temp stats are available
+        print(
+            f"  Temperatur [°C]    : min {stats['temp_min']:.2f} │ "
+            f"max {stats['temp_max']:.2f} │ Ø {stats['temp_mean']:.2f}"
+        )
+    else:
+        print("  Temperatur [°C]    : N/A")
+
+    if "hum_min" in stats: # Check if humidity stats are available
+        print(
+            f"  Luftfeuchte [%]    : min {stats['hum_min']:.2f} │ "
+            f"max {stats['hum_max']:.2f} │ Ø {stats['hum_mean']:.2f}"
+        )
+    else:
+        print("  Luftfeuchte [%]    : N/A")
+
+    # Output file saving is specific to CSV mode in the original script.
+    # We can pass args to this function if we want to keep that, or handle it in main.
+    # For now, this function only prints.
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Summarise total particle counts per size bin from OPC-N3 CSV."
     )
-    parser.add_argument("input_csv", type=Path)
+    # Modify input_csv argument
+    parser.add_argument("input_csv", type=Path, nargs='?', default=None,
+                        help="Input CSV file path (optional if COM port is specified).")
+    # Add com_port argument
+    parser.add_argument("--com_port", "-c", type=str, default=None,
+                        help="COM port for live data acquisition (optional if input CSV is specified).")
     parser.add_argument("--out", "-o", type=Path)
     parser.add_argument(
         "--skip",
@@ -139,37 +417,75 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    summary, stats, df = aggregate(args.input_csv, args.skip)
-    bin_cols = [c for c in df.columns if str(c).startswith(BIN_PREFIX)]
+    # Add validation logic
+    if args.input_csv is None and args.com_port is None:
+        parser.error("Error: Either an input CSV file or a COM port must be specified.")
 
-    print("\nGesamtsummen pro Größen-Bin:\n")
-    for (size, total), bin_col in zip(summary.itertuples(index=False), bin_cols):
-        counts10 = decile_counts(df, bin_col)
-        bar = timeline_bar(counts10)
-        print(f"{size:<22} {total:8d} {bar}")
+    if args.input_csv is not None and args.com_port is not None:
+        parser.error("Error: Please specify either an input CSV file or a COM port, not both.")
 
-    print("\nZusatzinformationen:")
-    print(f"  Messpunkte gesamt  : {stats['entries']}")
-    print(f"  Laufzeit (1000 ms) : {stats['runtime']}")
-    if "temp_min" in stats:
-        print(
-            f"  Temperatur [°C]    : min {stats['temp_min']:.2f} │ "
-            f"max {stats['temp_max']:.2f} │ Ø {stats['temp_mean']:.2f}"
-        )
-    if "hum_min" in stats:
-        print(
-            f"  Luftfeuchte [%]    : min {stats['hum_min']:.2f} │ "
-            f"max {stats['hum_max']:.2f} │ Ø {stats['hum_mean']:.2f}"
-        )
+    if args.com_port and not USBISS_AVAILABLE:
+        parser.error("Sensor libraries (pyusbiss, py-opc-ng) must be installed to use the --com_port option.")
 
-    if args.out:
-        summary.to_csv(args.out, index=False)
-        print(f"\nErgebnis gespeichert in: {args.out.resolve()}")
+    # Conditional processing based on input type
+    if args.com_port:
+        try:
+            print("Starting live data acquisition mode...")
+            # Set a small number of readings for easier/quicker testing during development
+            live_df = read_live_data(args.com_port, num_readings=10)
+
+            print("Starting live data acquisition mode with iterative display...")
+            # num_readings can be made an argument to the script later if desired
+            # For now, use a fixed number, e.g., 30 for 30 seconds.
+            # update_interval_secs=1 means update every second.
+            # The `read_live_data` itself now handles the KeyboardInterrupt for stopping.
+            full_live_df = read_live_data(args.com_port, num_readings=30, update_interval_secs=1)
+
+            clear_console() # Clear the last live update screen
+            print("--- FINAL SUMMARY OF LIVE DATA ---")
+            if full_live_df.empty:
+                print("No data was collected during the live session.")
+                # Call print_summary_and_timeline with empty data to show "Keine Datenpunkte"
+                empty_summary, empty_stats, empty_df = process_live_data(pd.DataFrame())
+                empty_bin_cols = []
+                print_summary_and_timeline(empty_summary, empty_stats, empty_df, empty_bin_cols, is_live_data=True)
+            else:
+                print(f"Total data points collected: {len(full_live_df)}")
+                # Process the full dataset for the final summary
+                summary_df, stats, processed_df = process_live_data(full_live_df)
+                bin_cols_for_timeline = [col for col in processed_df.columns if col.startswith(BIN_PREFIX)]
+                print_summary_and_timeline(summary_df, stats, processed_df, bin_cols_for_timeline, is_live_data=True)
+
+        except RuntimeError as e:
+            # This will catch errors from sensor connection primarily
+            # clear_console() # Optional: clear before error message
+            print(f"Error during live data session: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            # clear_console() # Optional
+            print(f"An unexpected error occurred during live data session: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.input_csv:
+        # Current CSV processing logic
+        print(f"Starting CSV processing for: {args.input_csv}")
+        summary_df, stats, processed_df = aggregate(args.input_csv, args.skip) # Renamed for consistency
+        bin_cols_for_timeline = [c for c in processed_df.columns if str(c).startswith(BIN_PREFIX)] # Renamed
+
+        print_summary_and_timeline(summary_df, stats, processed_df, bin_cols_for_timeline, is_live_data=False)
+
+        if args.out:
+            summary_df.to_csv(args.out, index=False) # Use summary_df
+            print(f"\nErgebnis gespeichert in: {args.out.resolve()}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"Fehler: {exc}", file=sys.stderr)
+        # Use parser.error for argument validation errors to show usage
+        if isinstance(exc, SystemExit) and exc.code == 2: # argparse errors exit with code 2
+            pass # Already handled by argparse
+        else:
+            print(f"Fehler: {exc}", file=sys.stderr)
         sys.exit(1)
