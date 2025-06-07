@@ -468,21 +468,22 @@ def print_summary_and_timeline(summary_df: pd.DataFrame,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Summarise total particle counts per size bin from OPC-N3 CSV."
+        description="Processes OPC-N3 sensor data. Reads from a CSV file or directly from the sensor in live mode. Displays a summary of particle counts per size bin, timeline visualisations, and key climate statistics. Output is capped at Bins 0-23."
     )
     # Modify input_csv argument
     parser.add_argument("input_csv", type=Path, nargs='?', default=None,
-                        help="Input CSV file path (optional if COM port is specified).")
+                        help="Path to the input CSV file containing OPC-N3 data. Required if not using live data mode via --com_port.")
     # Add com_port argument
     parser.add_argument("--com_port", "-c", type=str, default=None,
-                        help="COM port for live data acquisition (optional if input CSV is specified).")
-    parser.add_argument("--out", "-o", type=Path)
+                        help="COM port of the OPC-N3 sensor (e.g., COM3 or /dev/ttyUSB0). Enables live data mode if specified instead of an input CSV file.")
+    parser.add_argument("--out", "-o", type=Path,
+                        help="Optional path to save the generated summary table as a CSV file. Only applicable when input_csv is used.")
     parser.add_argument(
         "--skip",
         "-s",
         type=int,
         default=None,
-        help="Header lines to skip (default: auto).",
+        help="Number of header lines to skip in the input CSV file. If not provided, the script attempts to auto-detect the header length. Only applicable when input_csv is used.",
     )
     args = parser.parse_args()
 
